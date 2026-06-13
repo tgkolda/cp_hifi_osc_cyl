@@ -101,6 +101,10 @@ fprintf('mask: kept %d of %d cells (%.1f%% removed by %s)\n', ...
         sum(keep), numel(keep), 100*mean(~keep), mask_desc);
 fprintf('value scale: field multiplied by %g\n', val_scale);
 
+% Preserve the full (pre-subsample) observations for the comparison figure,
+% so the "Orig" row shows all the data rather than the thinned tensor.
+YZTV_full = YZTV;
+
 % Random subsample: each YZTV row becomes one tensor nonzero, so cap the row
 % count to keep nnz tractable. Set to Inf to disable. Seeded for reproducibility.
 target_nnz = 1e6;
@@ -308,28 +312,50 @@ tsel  = unique(round(linspace(1, numel(tv), nShow)));
 % Shared axis limits; color limits driven by the *data* range across all
 % shown timesteps so the originals always render correctly. If the
 % reconstruction overshoots, it will visibly saturate -- a feature, not a bug.
-mSel = ismember(YZTV(:,3), tv(tsel));
-cl = [min(YZTV(mSel,4)), max(YZTV(mSel,4))];
+mSel = ismember(YZTV_full(:,3), tv(tsel));
+cl = [min(YZTV_full(mSel,4)), max(YZTV_full(mSel,4))];
 yl = [min(yv) max(yv)];
 zl = [min(zv) max(zv)];
 
-% Layout: 2 rows x nShow cols. Top row = reconstructions, bottom = originals;
-% each column is one timestep.
+% Layout: 3 rows x nShow cols. Row 1 = full data, row 2 = sampled data (what
+% the tensor was fit on), row 3 = reconstruction; each column is one timestep.
+nRows = 3;
 figure(4); clf;
-set(gcf, 'Units', 'normalized', 'Position', [0.04 0.28 0.92 0.44]);  % wide rectangle, fits screen
+set(gcf, 'Units', 'normalized', 'Position', [0.04 0.12 0.92 0.78]);  % wide rectangle, fits screen
 for k = 1:numel(tsel)
     ti = tsel(k);
     tt = tv(ti);
     rec = squeeze(Xhat.data(:,:,ti));   % [Ny x Nz]
 
-    % Original: scattered observed points at the same timestep.
-    m = YZTV(:,3) == tt;
-    yo = YZTV(m,1);
-    zo = YZTV(m,2);
-    vo = YZTV(m,4);
+    % Full data: all observed points at this timestep.
+    mf = YZTV_full(:,3) == tt;
+    % Sampled data: the thinned points actually fed to the tensor.
+    ms = YZTV(:,3) == tt;
 
-    % Top row: reconstruction.
-    subplot(2, numel(tsel), k);
+    % Row 1: full data.
+    subplot(nRows, numel(tsel), k);
+    scatter(YZTV_full(mf,1), YZTV_full(mf,2), 18, YZTV_full(mf,4), 'filled', 's');
+    axis equal;
+    xlim(yl);
+    ylim(zl);
+    clim(cl);
+    title(sprintf('Full t = %.4g', tt));
+    if k == 1, ylabel('z'); end
+    xlabel('y');
+
+    % Row 2: sampled data.
+    subplot(nRows, numel(tsel), numel(tsel) + k);
+    scatter(YZTV(ms,1), YZTV(ms,2), 18, YZTV(ms,4), 'filled', 's');
+    axis equal;
+    xlim(yl);
+    ylim(zl);
+    clim(cl);
+    title(sprintf('Sampled t = %.4g', tt));
+    if k == 1, ylabel('z'); end
+    xlabel('y');
+
+    % Row 3: reconstruction.
+    subplot(nRows, numel(tsel), 2*numel(tsel) + k);
     imagesc(yv, zv, rec.');
     axis xy equal;
     xlim(yl);
@@ -338,21 +364,56 @@ for k = 1:numel(tsel)
     title(sprintf('Recon t = %.4g', tt));
     if k == 1, ylabel('z'); end
     xlabel('y');
-
-    % Bottom row: original.
-    subplot(2, numel(tsel), numel(tsel) + k);
-    scatter(yo, zo, 18, vo, 'filled', 's');
-    axis equal;
-    xlim(yl);
-    ylim(zl);
-    clim(cl);
-    title(sprintf('Orig t = %.4g', tt));
-    if k == 1, ylabel('z'); end
-    xlabel('y');
 end
 
 % One shared colorbar for the whole figure.
 colorbar('Position', [0.93 0.11 0.015 0.815]);
+
+%% Side-by-side movie: full | sampled | reconstruction, animated over time
+% Three panels in lockstep across every timestep. We draw each panel once,
+% keep its graphics handle, then update only the data each frame (CData /
+% XData / YData) so playback stays smooth instead of re-plotting every frame.
+fps = 10;                       % playback rate
+nT  = numel(tv);
+
+figure(6); clf;
+set(gcf, 'Units', 'normalized', 'Position', [0.04 0.30 0.92 0.40]);
+
+% Initialize each panel from the first timestep, capture handles.
+ti = 1; tt = tv(ti);
+mf = YZTV_full(:,3) == tt;
+ms = YZTV(:,3)      == tt;
+
+ax1 = subplot(1,3,1);
+hFull = scatter(YZTV_full(mf,1), YZTV_full(mf,2), 18, YZTV_full(mf,4), 'filled', 's');
+axis equal; xlim(yl); ylim(zl); clim(cl); xlabel('y'); ylabel('z'); title('Full');
+
+ax2 = subplot(1,3,2);
+hSamp = scatter(YZTV(ms,1), YZTV(ms,2), 18, YZTV(ms,4), 'filled', 's');
+axis equal; xlim(yl); ylim(zl); clim(cl); xlabel('y'); title('Sampled');
+
+ax3 = subplot(1,3,3);
+hRec = imagesc(yv, zv, squeeze(Xhat.data(:,:,ti)).');
+axis xy equal; xlim(yl); ylim(zl); clim(cl); xlabel('y'); title('Reconstruction');
+
+colorbar('Position', [0.93 0.11 0.015 0.815]);
+hSup = sgtitle(sprintf('t = %.4g   (frame %d/%d)', tt, ti, nT));
+
+% Animate. Loops once through all timesteps; wrap in `while ishandle(...)` if
+% you want it to repeat. Updates data in place for smooth playback.
+for ti = 1:nT
+    tt = tv(ti);
+    mf = YZTV_full(:,3) == tt;
+    ms = YZTV(:,3)      == tt;
+
+    set(hFull, 'XData', YZTV_full(mf,1), 'YData', YZTV_full(mf,2), 'CData', YZTV_full(mf,4));
+    set(hSamp, 'XData', YZTV(ms,1),      'YData', YZTV(ms,2),      'CData', YZTV(ms,4));
+    set(hRec,  'CData', squeeze(Xhat.data(:,:,ti)).');
+    set(hSup,  'String', sprintf('t = %.4g   (frame %d/%d)', tt, ti, nT));
+
+    drawnow;
+    pause(1/fps);
+end
 
 %% Storage comparison
 
